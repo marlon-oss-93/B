@@ -1,0 +1,265 @@
+name: ExtNoBrasil PC - Zorin OS (noVNC + Salvamento)
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: "Senha do VNC (atÃ© 8 caracteres)"
+        required: true
+      fresh_install:
+        description: "ComeÃ§ar do zero (ignora o save anterior)?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  zorin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      DISK: 450G
+      ISO_URL: https://distro.ibiblio.org/zorinos/18/Zorin-OS-18.1-Lite-64-bit.iso
+      VNC_PASS: ${{ inputs.vnc_password }}
+      GH_TOKEN: ${{ github.token }}
+      MAX_SECONDS: 19500
+
+    steps:
+      # 1. Pacotes
+      - name: Install packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          echo "::add-mask::$VNC_PASS"
+          [ -n "$VNC_PASS" ] || { echo "ERRO: informe a senha do VNC"; exit 1; }
+          echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            qemu-system-x86 qemu-utils novnc websockify aria2 curl wget \
+            ca-certificates zstd socat
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -O "$HOME/cloudflared"
+          chmod +x "$HOME/cloudflared"
+
+      # 2. Restaura o disco salvo (se existir)
+      - name: Restore saved Zorin disk
+        id: restore
+        if: ${{ !inputs.fresh_install }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/zorin-save
+          key: zorin-disk-nomatch-${{ github.run_id }}
+          restore-keys: |
+            zorin-disk-
+
+      # 3. KVM, ISO e disco
+      - name: Prepare disk, KVM and ISO
+        run: |
+          set -e
+          mkdir -p "$HOME/zorin" "$HOME/zorin-save"
+
+          # libera espaÃ§o em segundo plano
+          ( sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost >/dev/null 2>&1 ) &
+          CLEAN_PID=$!
+
+          # KVM
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          if [ -w /dev/kvm ]; then
+            echo "ACCEL=kvm" >> "$GITHUB_ENV"
+            echo "CPU_OPT=host" >> "$GITHUB_ENV"
+            echo "KVM disponÃ­vel."
+          else
+            echo "ACCEL=tcg,thread=multi" >> "$GITHUB_ENV"
+            echo "CPU_OPT=max" >> "$GITHUB_ENV"
+            echo "AVISO: sem KVM (repositÃ³rio privado). Vai ficar lento. Deixe o repo PÃšBLICO."
+          fi
+
+          # ISO
+          aria2c -x 16 -s 16 -k 1M --console-log-level=warn \
+            -d "$HOME/zorin" -o zorin.iso "$ISO_URL" \
+            || wget -q -O "$HOME/zorin/zorin.iso" "$ISO_URL"
+          SIZE=$(stat -c%s "$HOME/zorin/zorin.iso")
+          [ "$SIZE" -gt 1000000000 ] || { echo "ERRO: ISO incompleta ($SIZE bytes)"; exit 1; }
+
+          wait "$CLEAN_PID" || true
+          df -h / | tail -1
+
+          # ajustes do host
+          echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null || true
+          sudo sysctl -qw vm.swappiness=10 vm.dirty_ratio=40 vm.dirty_background_ratio=10 || true
+
+          # disco: restaura o salvo ou cria um novo
+          if [ -f "$HOME/zorin-save/zorin.qcow2.zst" ]; then
+            echo "Save encontrado: restaurando disco..."
+            zstd -d -T0 --rm -f "$HOME/zorin-save/zorin.qcow2.zst" -o "$HOME/zorin/zorin.qcow2"
+            echo "RESTORED=true" >> "$GITHUB_ENV"
+          else
+            echo "Nenhum save: criando disco novo."
+            qemu-img create -f qcow2 -o lazy_refcounts=on,preallocation=metadata,cluster_size=1M \
+              "$HOME/zorin/zorin.qcow2" "$DISK"
+            echo "RESTORED=false" >> "$GITHUB_ENV"
+          fi
+          ls -lh "$HOME/zorin/zorin.qcow2"
+
+      # 4. Launcher QEMU
+      - name: Create QEMU launcher
+        run: |
+          AVAIL_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+          VM_RAM_MB=$((AVAIL_MB - 1536))
+          [ "$VM_RAM_MB" -gt 13312 ] && VM_RAM_MB=13312
+          [ "$VM_RAM_MB" -lt 1536 ] && VM_RAM_MB=1536
+          VM_CPUS=$(nproc)
+          echo "VM_RAM_MB=$VM_RAM_MB" >> "$GITHUB_ENV"
+          echo "VM_CPUS=$VM_CPUS" >> "$GITHUB_ENV"
+          echo "RAM livre: ${AVAIL_MB} MB -> VM com ${VM_RAM_MB} MB, ${VM_CPUS} CPUs"
+
+          cat > "$HOME/zorin/start-zorin.sh" <<EOF
+          #!/usr/bin/env bash
+          exec qemu-system-x86_64 \\
+            -machine q35 \\
+            -accel ${ACCEL} \\
+            -cpu ${CPU_OPT} \\
+            -smp ${VM_CPUS} \\
+            -m ${VM_RAM_MB}M \\
+            -object iothread,id=io0 \\
+            -drive file=$HOME/zorin/zorin.qcow2,if=none,id=hd0,format=qcow2,cache=writeback,aio=threads,discard=unmap,l2-cache-size=32M \\
+            -device virtio-blk-pci,drive=hd0,iothread=io0,num-queues=${VM_CPUS} \\
+            -cdrom $HOME/zorin/zorin.iso \\
+            -boot order=cd,menu=off \\
+            -device virtio-vga \\
+            -device qemu-xhci -device usb-tablet \\
+            -object secret,id=vncpw,data=\${VNC_PASS} \\
+            -vnc 127.0.0.1:0,password-secret=vncpw \\
+            -monitor unix:$HOME/zorin/monitor.sock,server,nowait \\
+            -netdev user,id=net0 \\
+            -device virtio-net-pci,netdev=net0 \\
+            -device virtio-balloon-pci \\
+            -rtc base=localtime
+          EOF
+          chmod +x "$HOME/zorin/start-zorin.sh"
+
+      # 5. Inicia a VM
+      - name: Start Zorin VM
+        run: |
+          nohup "$HOME/zorin/start-zorin.sh" > "$HOME/zorin/qemu.log" 2>&1 &
+          echo "VM_STARTED=true" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            sleep 2
+            ss -ltn | grep -q "127.0.0.1:5900" && break
+          done
+          if ! pgrep -f qemu-system-x86_64 >/dev/null || ! ss -ltn | grep -q "127.0.0.1:5900"; then
+            echo "ERRO: QEMU nÃ£o iniciou"
+            cat "$HOME/zorin/qemu.log"
+            exit 1
+          fi
+          echo "VM online."
+
+      # 6. noVNC + link
+      - name: Start noVNC and tunnel
+        run: |
+          nohup websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5900 \
+            > "$HOME/zorin/novnc.log" 2>&1 &
+          sleep 3
+          nohup "$HOME/cloudflared" tunnel --url http://127.0.0.1:6080 --no-autoupdate \
+            > "$HOME/zorin/cloudflare.log" 2>&1 &
+
+          URL=""
+          for i in $(seq 1 15); do
+            sleep 2
+            URL="$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$HOME/zorin/cloudflare.log" | tail -n1)"
+            [ -n "$URL" ] && break
+          done
+          [ -n "$URL" ] || { echo "ERRO: link do Cloudflare nÃ£o gerado"; cat "$HOME/zorin/cloudflare.log"; exit 1; }
+          echo "NOVNC_URL=$URL" >> "$GITHUB_ENV"
+
+          echo "=============================================="
+          echo "  EXT NOBRASIL PC - ZORIN OS"
+          echo "  Abra: $URL/vnc.html"
+          echo "  Senha: a que vocÃª digitou ao rodar"
+          echo "  ${VM_CPUS} vCPU | ${VM_RAM_MB} MB RAM | ${DISK} disco | ${ACCEL%%,*}"
+          echo "  Disco restaurado do save: ${RESTORED}"
+          echo "  PRA SALVAR: desligue o Zorin por dentro (Desligar)."
+          echo "=============================================="
+
+      # 7. MantÃ©m online atÃ© desligar, cair ou chegar perto do limite
+      - name: Keep alive
+        run: |
+          COUNT=0
+          while true; do
+            NOW=$(date +%s)
+            if [ $((NOW - START_TS)) -ge "$MAX_SECONDS" ]; then
+              echo "Perto do limite de 6h: encerrando e salvando."
+              break
+            fi
+            pgrep -f qemu-system-x86_64 >/dev/null || { echo "VM desligada: indo salvar."; break; }
+            pgrep -f cloudflared >/dev/null || { echo "TÃºnel caiu: encerrando e salvando."; break; }
+            if [ $((COUNT % 15)) -eq 0 ]; then
+              echo "[$(date '+%H:%M:%S')] online - $NOVNC_URL/vnc.html"
+            fi
+            COUNT=$((COUNT + 1))
+            sleep 20
+          done
+
+      # 8. Desliga a VM com seguranÃ§a (tambÃ©m roda se vocÃª cancelar)
+      - name: Shutdown VM safely
+        if: always() && env.VM_STARTED == 'true'
+        run: |
+          if pgrep -f qemu-system-x86_64 >/dev/null; then
+            echo "Pedindo desligamento ao Zorin..."
+            echo system_powerdown | socat - UNIX-CONNECT:"$HOME/zorin/monitor.sock" || true
+            for i in $(seq 1 60); do
+              pgrep -f qemu-system-x86_64 >/dev/null || break
+              sleep 3
+            done
+            if pgrep -f qemu-system-x86_64 >/dev/null; then
+              echo "Zorin nÃ£o desligou a tempo: fechando a VM Ã  forÃ§a."
+              echo quit | socat - UNIX-CONNECT:"$HOME/zorin/monitor.sock" || true
+              sleep 5
+            fi
+          fi
+          pgrep -f qemu-system-x86_64 >/dev/null && echo "AVISO: QEMU ainda ativo" || echo "VM parada."
+
+      # 9. Compacta o disco
+      - name: Compress disk
+        if: always() && env.VM_STARTED == 'true'
+        run: |
+          if pgrep -f qemu-system-x86_64 >/dev/null; then
+            echo "QEMU ainda ativo: nÃ£o vou salvar pra nÃ£o corromper."
+            exit 0
+          fi
+          mkdir -p "$HOME/zorin-save"
+          rm -f "$HOME/zorin-save/zorin.qcow2.zst"
+          zstd -T0 -3 -f "$HOME/zorin/zorin.qcow2" -o "$HOME/zorin-save/zorin.qcow2.zst"
+          ls -lh "$HOME/zorin-save/zorin.qcow2.zst"
+          SIZE=$(stat -c%s "$HOME/zorin-save/zorin.qcow2.zst")
+          if [ "$SIZE" -gt 9800000000 ]; then
+            echo "ERRO: save com $((SIZE/1000000)) MB passa do limite de 10 GB do cache. NÃ£o vou salvar."
+            exit 0
+          fi
+          echo "SAVE_READY=true" >> "$GITHUB_ENV"
+
+      # 10. Salva no cache do GitHub
+      - name: Save disk to cache
+        id: save
+        if: always() && env.SAVE_READY == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/zorin-save
+          key: zorin-disk-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # 11. Apaga saves antigos (mantÃ©m sÃ³ o mais novo)
+      - name: Delete older saves
+        if: always() && steps.save.outcome == 'success'
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key zorin-disk- \
+            --sort created_at --order desc --limit 50 --json id --jq '.[1:][].id' \
+            | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY" || true
+          echo "Save concluÃ­do."
